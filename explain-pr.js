@@ -46,6 +46,7 @@ function normalizeLanguage(input) {
 function readEventContext() {
   let prTitle = process.env.PR_TITLE || 'Code Changes';
   let prNumber = process.env.PR_NUMBER || '0';
+  let prBody = '';
 
   const eventPath = process.env.GITHUB_EVENT_PATH;
   if (eventPath && existsSync(eventPath)) {
@@ -54,13 +55,14 @@ function readEventContext() {
       if (eventData.pull_request) {
         prTitle = eventData.pull_request.title || prTitle;
         prNumber = String(eventData.pull_request.number || prNumber);
+        prBody = (eventData.pull_request.body || '').trim();
       }
     } catch (error) {
       console.error('Failed to read the GitHub event payload:', error);
     }
   }
 
-  return { prTitle, prNumber };
+  return { prTitle, prNumber, prBody };
 }
 
 function getDiffContent(diffFilePath) {
@@ -247,10 +249,16 @@ function getGenerationDate(language) {
   });
 }
 
-function buildUserPrompt({ language, prTitle, prNumber, cappedDiff }) {
+function buildUserPrompt({ language, prTitle, prNumber, prBody, cappedDiff }) {
+  const hasBody = Boolean(prBody && prBody.trim().length > 0);
+
   if (language === 'pt-BR') {
+    const descriptionSection = hasBody
+      ? `\n\nEsta é a descrição do Pull Request:\n"""\n${prBody.trim()}\n"""`
+      : '';
+
     return `Este é o título do Pull Request: "${prTitle}"
-Número do PR: ${prNumber}
+Número do PR: ${prNumber}${descriptionSection}
 
 Este é o git diff a ser analisado:
 \`\`\`diff
@@ -258,8 +266,12 @@ ${cappedDiff}
 \`\`\``;
   }
 
+  const descriptionSection = hasBody
+    ? `\n\nHere is the Pull Request description:\n"""\n${prBody.trim()}\n"""`
+    : '';
+
   return `Here is the Pull Request title: "${prTitle}"
-PR number: ${prNumber}
+PR number: ${prNumber}${descriptionSection}
 
 Here is the git diff to analyze:
 \`\`\`diff
@@ -281,17 +293,24 @@ function renderQuizHtml(quiz, language) {
       optionsHtml += `
             <div class="space-y-2">
                 <button id="btn-q${questionIndex}-o${optionIndex}"
+                        type="button"
                         data-correct="${isCorrect}"
+                        aria-pressed="false"
+                        aria-disabled="false"
                         onclick="selectOption(${questionIndex}, ${optionIndex}, ${isCorrect}, 'ex-q${questionIndex}-o${optionIndex}')"
-                        class="option-btn text-left p-4 w-full rounded-lg border border-gray-800 bg-[#0f0f0f] hover:border-purple-500 text-sm font-sans flex items-center justify-between group">
+                        class="option-btn text-left p-4 w-full rounded-lg border border-gray-800 bg-[#0f0f0f] hover:border-purple-500 text-base font-sans flex items-center justify-between group">
                     <span>${escapeHtml(option)}</span>
                     <span class="opacity-0 group-hover:opacity-100 transition-opacity text-purple-400 text-xs font-mono">${labels.select}</span>
                 </button>
-                <div id="ex-q${questionIndex}-o${optionIndex}" class="explanation-box p-4 rounded-lg bg-gray-900/40 border border-gray-800 text-xs text-gray-400 space-y-1">
-                    <p class="font-bold ${isCorrect ? 'text-green-400' : 'text-red-400'}">
-                        ${isCorrect ? '✓' : '✗'} ${statusLabel}
-                    </p>
-                    <p>${escapeHtml(question.explanations[optionIndex] || '')}</p>
+                <div id="ex-q${questionIndex}-o${optionIndex}" class="explanation-box rounded-lg bg-gray-900/40 border border-gray-800 text-sm text-gray-400">
+                    <div class="explanation-inner">
+                        <div class="p-4 space-y-1">
+                            <p class="font-bold ${isCorrect ? 'text-green-400' : 'text-red-400'}">
+                                ${isCorrect ? '✓' : '✗'} ${statusLabel}
+                            </p>
+                            <p>${escapeHtml(question.explanations[optionIndex] || '')}</p>
+                        </div>
+                    </div>
                 </div>
             </div>`;
     });
@@ -316,20 +335,116 @@ function renderQuizHtml(quiz, language) {
   return quizHtml;
 }
 
+function stripMarkdownFences(text) {
+  let result = text;
+
+  if (result.startsWith('```json')) {
+    result = result.substring(7);
+  } else if (result.startsWith('```')) {
+    result = result.substring(3);
+  }
+
+  if (result.endsWith('```')) {
+    result = result.substring(0, result.length - 3);
+  }
+
+  return result.trim();
+}
+
+/**
+ * Tenta reparar um JSON truncado fechando chaves/colchetes/strings abertas.
+ * Estratégia conservadora: se não encontrar um '{' inicial, retorna null.
+ * Se o repair também falhar no parse, retorna null.
+ */
+function repairTruncatedJson(text) {
+  const start = text.indexOf('{');
+  if (start === -1) return null;
+
+  let json = text.substring(start);
+
+  // Fechar string aberta se necessário (paridade de aspas na última linha)
+  const lastNewline = json.lastIndexOf('\n');
+  const lastLine = lastNewline === -1 ? json : json.substring(lastNewline);
+  const quoteCount = (lastLine.match(/(?<!\\)"/g) || []).length;
+  if (quoteCount % 2 !== 0) {
+    json += '"';
+  }
+
+  // Contar chaves e colchetes abertos e fechá-los
+  const stack = [];
+  let inString = false;
+  let escape = false;
+
+  for (const char of json) {
+    if (escape) { escape = false; continue; }
+    if (char === '\\' && inString) { escape = true; continue; }
+    if (char === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (char === '{' || char === '[') stack.push(char);
+    else if (char === '}' || char === ']') stack.pop();
+  }
+
+  // Fechar em ordem reversa
+  while (stack.length > 0) {
+    const open = stack.pop();
+    json += open === '{' ? '}' : ']';
+  }
+
+  try {
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
+
 function parseModelContent(rawContent) {
-  let contentText = String(rawContent || '').trim();
+  const contentText = stripMarkdownFences(String(rawContent || ''));
 
-  if (contentText.startsWith('```json')) {
-    contentText = contentText.substring(7);
-  } else if (contentText.startsWith('```')) {
-    contentText = contentText.substring(3);
+  // Tentativa 1: parse direto
+  try {
+    return JSON.parse(contentText);
+  } catch (firstError) {
+    console.warn(`JSON parse direto falhou: ${firstError.message}. Tentando repair...`);
+    console.warn(`Raw response (primeiros 500 chars): ${contentText.substring(0, 500)}`);
   }
 
-  if (contentText.endsWith('```')) {
-    contentText = contentText.substring(0, contentText.length - 3);
+  // Tentativa 2: repair de truncamento
+  const repaired = repairTruncatedJson(contentText);
+  if (repaired !== null) {
+    console.warn('JSON repair bem-sucedido, mas resposta estava truncada. Será tratado como falha para retry.');
+    // Intencionalmente lançamos erro mesmo com repair: conteúdo parcial não é aceitável
+    throw new Error('JSON estava truncado — repair possível mas conteúdo parcial rejeitado para garantir qualidade.');
   }
 
-  return JSON.parse(contentText.trim());
+  throw new Error('Failed to parse JSON — resposta da LLM é inválida e não reparável.');
+}
+
+/**
+ * Valida que os campos essenciais do explanation não estão todos vazios.
+ * Campos vazios indicam que o modelo retornou JSON válido mas sem conteúdo útil.
+ */
+function validateExplanation(explanation) {
+  const essentialFields = ['background', 'intuition', 'diagrams', 'codeWalkthrough'];
+  const nonEmptyFields = essentialFields.filter(
+    (field) => explanation[field] && String(explanation[field]).trim().length > 0
+  );
+
+  if (nonEmptyFields.length === 0) {
+    throw new Error('Explanation retornada pela LLM tem todos os campos essenciais vazios.');
+  }
+
+  const emptyFields = essentialFields.filter((f) => !nonEmptyFields.includes(f));
+  if (emptyFields.length > 0) {
+    console.warn(`Campos vazios na explanation: ${emptyFields.join(', ')}. Continuando com conteúdo parcial.`);
+  }
+}
+
+const MAX_RETRIES = 2; // Total de tentativas = 1 inicial + 2 retries
+const RETRY_BASE_DELAY_MS = 2000;
+const FETCH_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutos por tentativa
+
+async function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function callOpenRouter({
@@ -342,46 +457,90 @@ async function callOpenRouter({
 }) {
   if (mockResponsePath) {
     const mockData = JSON.parse(readFileSync(mockResponsePath, 'utf8'));
+    const explanation = parseModelContent(mockData.choices[0].message.content);
+    validateExplanation(explanation);
     return {
-      explanation: parseModelContent(mockData.choices[0].message.content),
+      explanation,
       usage: mockData.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
     };
   }
 
-  const response = await fetch(`${apiBaseUrl}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-      'HTTP-Referer': 'https://github.com/SantanaInteligencia/app',
-      'X-Title': 'SIP PR Explainer'
-    },
-    body: JSON.stringify({
-      model: modelName,
-      messages: [
-        { role: 'system', content: systemInstruction },
-        { role: 'user', content: userPrompt }
-      ],
-      temperature: 0.1,
-      response_format: { type: 'json_object' }
-    })
-  });
+  let lastError;
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`OpenRouter API error: status ${response.status} - ${errorText}`);
+  for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt++) {
+    if (attempt > 1) {
+      const delayMs = RETRY_BASE_DELAY_MS * Math.pow(2, attempt - 2); // 2s, 4s
+      console.warn(`Tentativa ${attempt}/${MAX_RETRIES + 1} após ${delayMs}ms...`);
+      await sleep(delayMs);
+    }
+
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+
+      let response;
+      try {
+        response = await fetch(`${apiBaseUrl}/chat/completions`, {
+          signal: controller.signal,
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+            'HTTP-Referer': 'https://github.com/rafaeltorresng/pr-explainer-action',
+            'X-Title': 'PR Explainer AI'
+          },
+          body: JSON.stringify({
+            model: modelName,
+            messages: [
+              { role: 'system', content: systemInstruction },
+              { role: 'user', content: userPrompt }
+            ],
+            temperature: 0.1,
+            response_format: { type: 'json_object' }
+          })
+        });
+      } catch (fetchError) {
+        if (fetchError.name === 'AbortError') {
+          throw new Error(`OpenRouter request timed out after ${FETCH_TIMEOUT_MS / 1000}s.`);
+        }
+        throw fetchError;
+      } finally {
+        clearTimeout(timeoutId);
+      }
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`OpenRouter API error: status ${response.status} - ${errorText}`);
+      }
+
+      const data = await response.json();
+      if (!data || !data.choices || data.choices.length === 0 || !data.choices[0].message) {
+        console.error('Invalid OpenRouter API response:', JSON.stringify(data));
+        throw new Error('OpenRouter returned a malformed response or no choices.');
+      }
+
+      const explanation = parseModelContent(data.choices[0].message.content);
+      validateExplanation(explanation);
+
+      if (attempt > 1) {
+        console.log(`Sucesso na tentativa ${attempt}.`);
+      }
+
+      return {
+        explanation,
+        usage: data.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+      };
+    } catch (error) {
+      lastError = error;
+      console.warn(`Tentativa ${attempt} falhou: ${error.message}`);
+
+      if (attempt === MAX_RETRIES + 1) {
+        console.error(`Todas as ${MAX_RETRIES + 1} tentativas falharam.`);
+      }
+    }
   }
 
-  const data = await response.json();
-  if (!data || !data.choices || data.choices.length === 0 || !data.choices[0].message) {
-    console.error('Invalid OpenRouter API response:', JSON.stringify(data));
-    throw new Error('OpenRouter returned a malformed response or no choices.');
-  }
-
-  return {
-    explanation: parseModelContent(data.choices[0].message.content),
-    usage: data.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-  };
+  throw lastError;
 }
 
 async function generateExplanation({
@@ -398,7 +557,7 @@ async function generateExplanation({
   }
 
   const language = normalizeLanguage(languageInput);
-  const { prTitle, prNumber } = readEventContext();
+  const { prTitle, prNumber, prBody } = readEventContext();
   const diffContent = getDiffContent(diffFilePath);
 
   if (diffContent.length === 0) {
@@ -411,7 +570,7 @@ async function generateExplanation({
   let htmlTemplate = readFileSync(templatePath, 'utf8');
   const systemInstruction = getPrompt(language);
   const cappedDiff = diffContent.substring(0, 40000);
-  const userPrompt = buildUserPrompt({ language, prTitle, prNumber, cappedDiff });
+  const userPrompt = buildUserPrompt({ language, prTitle, prNumber, prBody, cappedDiff });
 
   console.log(`Starting OpenRouter request (${modelName}) with language ${language}...`);
 
@@ -430,28 +589,69 @@ async function generateExplanation({
   console.log('Formatting quiz...');
 
   const normalizedQuiz = normalizeQuiz(explanation.quiz, `${prNumber}:${prTitle}:${language}`);
+
+  if (normalizedQuiz.length === 0) {
+    console.warn(
+      'Quiz returned 0 valid questions after normalization. ' +
+      `Raw quiz had ${Array.isArray(explanation.quiz) ? explanation.quiz.length : 'no'} entries. ` +
+      'The quiz section will be empty in the output.'
+    );
+  }
+
   const quizHtml = renderQuizHtml(normalizedQuiz, language);
   const generationDate = getGenerationDate(language);
 
   console.log('Injecting content into the HTML template...');
 
-  const inputCost = (usage.prompt_tokens / 1000000) * 0.089;
-  const outputCost = (usage.completion_tokens / 1000000) * 0.18;
-  const totalCost = inputCost + outputCost;
-  const formattedPrice = totalCost.toFixed(6);
+  // OpenRouter list price for the default DeepSeek V4 Flash model.
+  // When users override openrouter_model, do not invent a dollar estimate.
+  const isDefaultModel = modelName === DEFAULT_MODEL_NAME;
+  const inputRatePerMillion = 0.09;
+  const outputRatePerMillion = 0.18;
+  const formattedPrice = isDefaultModel
+    ? `$${(
+        (usage.prompt_tokens / 1000000) * inputRatePerMillion +
+        (usage.completion_tokens / 1000000) * outputRatePerMillion
+      ).toFixed(6)}`
+    : 'n/a';
+  const rateChip = isDefaultModel
+    ? (language === 'pt-BR'
+      ? `Entrada / saída: $${inputRatePerMillion} / $${outputRatePerMillion} por 1M`
+      : `Input / Output: $${inputRatePerMillion} / $${outputRatePerMillion} per 1M`)
+    : (language === 'pt-BR'
+      ? 'Tarifa: conforme o modelo escolhido no OpenRouter'
+      : 'Rate: per selected OpenRouter model');
 
+  const background = explanation.background || '';
+  const intuition = explanation.intuition || '';
+  const diagrams = explanation.diagrams || '';
+  const codeWalkthrough = explanation.codeWalkthrough || '';
+
+  // Use replacer functions to prevent String.replace() from interpreting
+  // special patterns like $&, $1, $$ in the replacement value.
+  // prTitle is HTML-escaped to prevent layout breakage or XSS from titles
+  // containing <, >, &, or quotes.
   htmlTemplate = htmlTemplate
-    .replace(/{{PR_NUMBER}}/g, prNumber)
-    .replace(/{{PR_TITLE}}/g, prTitle)
-    .replace(/{{GENERATION_DATE}}/g, generationDate)
-    .replace(/{{TOTAL_PRICE}}/g, formattedPrice)
-    .replace(/{{BACKGROUND_CONTENT}}/g, explanation.background || '')
-    .replace(/{{INTUITION_CONTENT}}/g, explanation.intuition || '')
-    .replace(/{{DIAGRAMS_CONTENT}}/g, explanation.diagrams || '')
-    .replace(/{{CODE_CONTENT}}/g, explanation.codeWalkthrough || '')
-    .replace(/{{QUIZ_CONTENT}}/g, quizHtml);
+    .replace(/{{PR_NUMBER}}/g, () => prNumber)
+    .replace(/{{PR_TITLE}}/g, () => escapeHtml(prTitle))
+    .replace(/{{GENERATION_DATE}}/g, () => generationDate)
+    .replace(/{{TOTAL_PRICE}}/g, () => formattedPrice)
+    .replace(/{{RATE_CHIP}}/g, () => rateChip)
+    .replace(/{{BACKGROUND_CONTENT}}/g, () => background)
+    .replace(/{{INTUITION_CONTENT}}/g, () => intuition)
+    .replace(/{{DIAGRAMS_CONTENT}}/g, () => diagrams)
+    .replace(/{{CODE_CONTENT}}/g, () => codeWalkthrough)
+    .replace(/{{QUIZ_CONTENT}}/g, () => quizHtml);
 
-  writeFileSync(outputFilePath, htmlTemplate, 'utf8');
+  try {
+    writeFileSync(outputFilePath, htmlTemplate, 'utf8');
+  } catch (writeError) {
+    throw new Error(
+      `Failed to write output file at "${outputFilePath}" ` +
+      `(content size: ${htmlTemplate.length} bytes): ${writeError.message}`
+    );
+  }
+
   console.log(`\nSuccess. PR explanation generated at: ${outputFilePath}`);
 
   return {
@@ -492,11 +692,15 @@ if (require.main === module) {
 module.exports = {
   DEFAULT_LANGUAGE,
   DEFAULT_MODEL_NAME,
+  FETCH_TIMEOUT_MS,
   LANGUAGE_CONFIG,
   buildTargetCorrectIndexes,
+  buildUserPrompt,
   generateExplanation,
   getPrompt,
   normalizeLanguage,
   normalizeQuiz,
-  renderQuizHtml
+  parseModelContent,
+  renderQuizHtml,
+  validateExplanation
 };
